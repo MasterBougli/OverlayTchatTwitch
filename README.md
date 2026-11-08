@@ -88,3 +88,5 @@ L'application offre des options avancées de connexion :
 Copyright © 2024 BGS - Bougli Game Studio. Tous droits réservés.
 
 Voir le fichier LICENSE pour plus de détails sur les restrictions de copyright. 
+
+**Soutenir Bougli** · [Faire un don PayPal via Streamlabs](https://streamlabs.com/bouglitv) · [Soutenir sur Patreon](https://www.patreon.com/cw/Bougli)
