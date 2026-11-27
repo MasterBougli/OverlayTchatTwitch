@@ -1,10 +1,10 @@
 # Overlay Twitch Chat 2.0
 
-Overlay de chat Twitch pour Windows 10 et 11, écrit en Rust. Téléchargez `overlay-tchat-twitch.exe` dans les [releases](https://github.com/MasterBougli/OverlayTchatTwitch/releases) et lancez-le depuis un dossier accessible en écriture. Entrez votre chaîne puis cliquez sur **Appliquer**.
+Overlay de chat Twitch pour Windows 10 et 11, écrit en Rust. Téléchargez `overlay-tchat-twitch.exe` dans les [releases](https://github.com/MasterBougli/OverlayTchatTwitch/releases) et lancez-le depuis un dossier accessible en écriture. Entrez votre chaîne puis cliquez sur **OK**.
 
-Le clic gauche sur l’icône de notification affiche ou masque le chat. Le clic droit ouvre le menu des options. Dans les options, déplacez la fenêtre par la poignée supérieure et ajustez ses dimensions, les couleurs de fond par leur opacité, la taille du texte, la limite de messages et le délai de reconnexion. Cliquez sur **Appliquer** pour enregistrer. En mode lecture les clics traversent la fenêtre.
+Le clic gauche sur l’icône de notification affiche ou masque le chat. Le clic droit ouvre le menu des options. Lorsque les options sont ouvertes, déplacez directement la fenêtre du chat avec le clic gauche. Cliquez sur **OK** pour enregistrer. En mode lecture les clics traversent la fenêtre.
 
-La V2 lit les réglages de `config.ini` de la V1 au premier lancement et écrit ensuite dans `config-v2.ini` à côté de l’exécutable. La connexion anonyme utilise IRC sur TLS. Les pseudos reprennent leur couleur Twitch et les badges apparaissent sous forme de libellés.
+Les réglages sont enregistrés dans `config.ini` au format de la V1. La connexion anonyme utilise IRC sur TLS. Le pseudo IRC reprend sa couleur Twitch et un point vert identifie les modérateurs.
 
 ## Compilation Windows x64
 

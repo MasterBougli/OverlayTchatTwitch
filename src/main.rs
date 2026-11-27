@@ -12,7 +12,9 @@ use tray_icon::{
 fn path(name: &str) -> PathBuf {
     std::env::current_exe().unwrap().with_file_name(name)
 }
+#[derive(Clone)]
 struct Settings {
+    completed: bool,
     channel: String,
     font: u32,
     opacity: u32,
@@ -39,25 +41,29 @@ impl Settings {
             Some([p.next()?.parse().ok()?, p.next()?.parse().ok()?])
         });
         Self {
+            completed: ini.get("App", "FirstLaunchCompleted").is_some(),
             channel: ini.get("Chat", "Channel").unwrap_or_default(),
-            font: num("Style", "FontSize", 14, 8, 72),
+            font: num("Style", "FontSize", 14, 8, 24),
             opacity: num("Style", "BgOpacity", 40, 0, 100),
-            limit: num("Chat", "MaxMessages", 100, 1, 2000),
+            limit: num("Chat", "MaxMessages", 100, 10, 500),
             retry: ini
                 .getbool("Connection", "AutoReconnect")
                 .ok()
                 .flatten()
                 .unwrap_or(true),
-            delay: num("Connection", "ReconnectInterval", 10000, 1000, 300000),
+            delay: num("Connection", "ReconnectInterval", 10000, 5000, 60000),
             size: [
-                num("Window", "Width", 350, 200, 3840),
-                num("Window", "Height", 600, 150, 2160),
+                num("Window", "Width", 350, 200, 800),
+                num("Window", "Height", 600, 200, 1200),
             ],
             position,
         }
     }
     fn save(&self) -> std::io::Result<()> {
-        let mut ini = Ini::new();
+        let mut ini = Ini::new_cs();
+        if self.completed {
+            ini.set("App", "FirstLaunchCompleted", Some("true".into()));
+        }
         for (s, k, v) in [
             ("Chat", "Channel", self.channel.clone()),
             ("Chat", "MaxMessages", self.limit.to_string()),
@@ -77,16 +83,22 @@ impl Settings {
                 Some(format!("@Point({} {})", x as i32, y as i32)),
             );
         }
-        ini.write(path("config-v2.ini"))
+        ini.write(path("config.ini"))
     }
 }
 enum Action {
+    About,
     Options,
     Toggle,
     Quit,
 }
 struct App {
     cfg: Settings,
+    draft: Settings,
+    tab: usize,
+    about: bool,
+    prompt: u8,
+    policy: std::sync::Arc<std::sync::Mutex<(bool, u64)>>,
     options: bool,
     visible: bool,
     error: String,
@@ -107,13 +119,7 @@ impl App {
         }
         let (stop, signal) = mpsc::channel();
         self.stop = Some(stop);
-        chat::start(
-            self.cfg.channel.clone(),
-            self.cfg.retry,
-            self.cfg.delay as u64,
-            tx,
-            signal,
-        );
+        chat::start(self.cfg.channel.clone(), self.policy.clone(), tx, signal);
     }
     fn new(
         ctx: &egui::Context,
@@ -121,9 +127,10 @@ impl App {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let menu = Menu::new();
         let options = MenuItem::new("Options", true, None);
-        let toggle = MenuItem::new("Afficher / masquer", true, None);
+        let toggle = MenuItem::new("À propos", true, None);
         let quit = MenuItem::new("Quitter", true, None);
-        menu.append_items(&[&options, &toggle, &quit])?;
+        let separator = tray_icon::menu::PredefinedMenuItem::separator();
+        menu.append_items(&[&options, &toggle, &separator, &quit])?;
         let (tx, actions) = mpsc::channel();
         let options_id = options.id().clone();
         let quit_id = quit.id().clone();
@@ -135,7 +142,7 @@ impl App {
             } else if event.id == quit_id {
                 Action::Quit
             } else {
-                Action::Toggle
+                Action::About
             };
             let _ = sender.send(action);
             wake.request_repaint();
@@ -154,18 +161,7 @@ impl App {
                 wake.request_repaint();
             }
         }));
-        let mut pixels = Vec::new();
-        for y in 0..32 {
-            for x in 0..32 {
-                let white = (6..26).contains(&x) && (7..22).contains(&y)
-                    || ((7..12).contains(&x) && (21..26).contains(&y));
-                pixels.extend(if white {
-                    [255, 255, 255, 255]
-                } else {
-                    [104, 62, 180, 255]
-                });
-            }
-        }
+        let pixels = [128u8, 0, 128, 255].repeat(32 * 32);
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
@@ -173,6 +169,11 @@ impl App {
             .with_icon(tray_icon::Icon::from_rgba(pixels, 32, 32)?)
             .build()?;
         let mut app = Self {
+            draft: cfg.clone(),
+            tab: 0,
+            about: false,
+            prompt: 0,
+            policy: std::sync::Arc::new(std::sync::Mutex::new((cfg.retry, cfg.delay as u64))),
             options: cfg.channel.is_empty(),
             visible: true,
             error: String::new(),
@@ -195,7 +196,14 @@ impl eframe::App for App {
         for action in self.actions.try_iter() {
             match action {
                 Action::Quit => ctx.send_viewport_cmd(Cmd::Close),
+                Action::About => self.about = true,
                 Action::Options => {
+                    if !self.options {
+                        self.draft = self.cfg.clone();
+                        self.tab = 0;
+                        self.prompt = 0;
+                        self.error.clear();
+                    }
                     self.options = true;
                     self.visible = true;
                 }
@@ -208,91 +216,89 @@ impl eframe::App for App {
             self.lines.pop_front();
         }
         ctx.request_repaint_after(Duration::from_millis(150));
+        let initializing = self.cfg.position.is_none();
+        if initializing {
+            let x = ctx.input(|i| {
+                i.viewport()
+                    .monitor_size
+                    .map(|s| s.x - self.cfg.size[0] as f32 - 20.)
+                    .unwrap_or(50.)
+            });
+            ctx.send_viewport_cmd(Cmd::OuterPosition(egui::pos2(x, 20.)));
+            self.cfg.position = Some([x, 20.]);
+            if let Err(e) = self.cfg.save() {
+                self.error = e.to_string();
+            }
+        }
+        if self.options {
+            if !initializing
+                && let Some(pos) =
+                    ctx.input(|i| i.viewport().outer_rect.map(|r| [r.min.x, r.min.y]))
+            {
+                if self.cfg.position != Some(pos) {
+                    self.cfg.position = Some(pos);
+                    if let Err(e) = self.cfg.save() {
+                        self.error = e.to_string();
+                    }
+                }
+            }
+            ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("options"),egui::ViewportBuilder::default().with_title("Options").with_inner_size([400.,360.]).with_always_on_top(),|dialog,_|{
+                if dialog.input(|i|i.viewport().close_requested()){if self.cfg.channel.is_empty()&&!self.cfg.completed{dialog.send_viewport_cmd(Cmd::CancelClose);self.prompt=2;}else{self.options=false;}}
+                egui::CentralPanel::default().show(dialog,|ui|{
+                    if self.prompt!=0{
+                        ui.label(if self.prompt==1{"Réinitialiser tous les paramètres et redémarrer l’application ?"}else{"Aucune chaîne configurée. Voulez-vous quitter l’application ?"});
+                        if ui.button("Non").clicked(){if self.prompt==2{self.cfg.completed=true;if let Err(e)=self.cfg.save(){self.error=e.to_string();}self.options=false;}self.prompt=0;}
+                        if ui.button("Oui").clicked(){if self.prompt==2{ctx.send_viewport_cmd_to(egui::ViewportId::ROOT,Cmd::Close);}else{
+                            let reset=Settings::read(&Ini::new());match reset.save().and_then(|_|std::process::Command::new(std::env::current_exe()?).spawn()){Ok(_)=>ctx.send_viewport_cmd_to(egui::ViewportId::ROOT,Cmd::Close),Err(e)=>self.error=e.to_string()}self.prompt=0;
+                        }}return;
+                    }
+                    ui.label("Vous pouvez déplacer le chat avec le clic gauche pendant que cette fenêtre est ouverte.");
+                    if self.cfg.channel.is_empty(){ui.colored_label(Color32::LIGHT_RED,"Veuillez configurer une chaîne Twitch pour commencer.");}
+                    ui.horizontal(|ui|{for (i,title) in ["Général","Apparence","Connexion"].iter().enumerate(){ui.selectable_value(&mut self.tab,i,*title);}});
+                    ui.separator();
+                    let d=&mut self.draft;
+                    match self.tab{
+                        0=>{ui.label("Chaîne Twitch");ui.text_edit_singleline(&mut d.channel);ui.add(egui::Slider::new(&mut d.limit,10..=500).text("Nb max. de messages"));},
+                        1=>{ui.add(egui::Slider::new(&mut d.font,8..=24).text("Taille de la police"));ui.add(egui::Slider::new(&mut d.opacity,0..=100).text("Opacité (%)"));ui.add(egui::Slider::new(&mut d.size[0],200..=800).text("Largeur"));ui.add(egui::Slider::new(&mut d.size[1],200..=1200).text("Hauteur"));},
+                        _=>{ui.checkbox(&mut d.retry,"Reconnexion automatique");ui.label("Intervalle de reconnexion");ui.add_enabled(d.retry,egui::DragValue::new(&mut d.delay).range(5000..=60000).speed(1000).suffix(" ms"));}
+                    }
+                    ui.separator();let file=path("config.ini");ui.label(file.display().to_string());
+                    if ui.button("Ouvrir le dossier").clicked(){if let Err(e)=std::process::Command::new("explorer.exe").arg(file.parent().unwrap()).spawn(){self.error=e.to_string();}}
+                    ui.horizontal(|ui|{
+                        if ui.button("Réinitialiser").clicked(){self.prompt=1;}
+                        if ui.add_enabled(self.cfg.completed||!self.cfg.channel.is_empty(),egui::Button::new("Annuler")).clicked(){self.options=false;}
+                        if ui.button("OK").clicked(){
+                            self.draft.channel=self.draft.channel.trim().to_string();
+                            if self.draft.channel.is_empty()||self.draft.channel.contains(['\r','\n']){self.error="Vous devez entrer un nom de chaîne Twitch.".into();return;}
+                            self.draft.position=self.cfg.position;self.draft.completed=true;
+                            if let Err(e)=self.draft.save(){self.error=e.to_string();return;}
+                            let changed=self.cfg.channel!=self.draft.channel;self.cfg=self.draft.clone();
+                            *self.policy.lock().unwrap()=(self.cfg.retry,self.cfg.delay as u64);
+                            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT,Cmd::InnerSize(egui::vec2(self.cfg.size[0] as f32,self.cfg.size[1] as f32)));
+                            self.options=false;if changed{self.connect();}
+                        }
+                    });ui.label(&self.error);
+                });
+            });
+        }
+        if self.about {
+            ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("about"),egui::ViewportBuilder::default().with_title("À propos").with_inner_size([350.,150.]).with_always_on_top(),|v,_|{egui::CentralPanel::default().show(v,|ui|{ui.heading("Overlay Twitch Chat");ui.label(concat!("Version ",env!("CARGO_PKG_VERSION")));ui.label("Développé par Bougli");ui.label("Un overlay pour afficher le chat Twitch par dessus n’importe quelle application.");if ui.button("OK").clicked()||v.input(|i|i.viewport().close_requested()){self.about=false;}});});
+        }
         if !self.visible {
             return;
         }
-        let bg = if self.options {
-            Color32::from_gray(30)
-        } else {
-            Color32::from_black_alpha((self.cfg.opacity * 255 / 100) as u8)
-        };
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(bg).inner_margin(6))
-            .show(ctx, |ui| {
-                if self.options {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        if ui
-                            .add(
-                                egui::Label::new("?  D�placer l'overlay")
-                                    .sense(egui::Sense::drag()),
-                            )
-                            .drag_started()
-                        {
-                            ctx.send_viewport_cmd(Cmd::StartDrag);
-                        }
-                        ui.heading("Options Twitch");
-                        ui.label("Cha�ne Twitch");
-                        ui.text_edit_singleline(&mut self.cfg.channel);
-                        ui.add(egui::Slider::new(&mut self.cfg.font, 8..=72).text("Police"));
-                        ui.add(egui::Slider::new(&mut self.cfg.opacity, 0..=100).text("Fond (%)"));
-                        ui.add(egui::Slider::new(&mut self.cfg.limit, 1..=2000).text("Messages"));
-                        ui.add(
-                            egui::Slider::new(&mut self.cfg.size[0], 200..=3840).text("Largeur"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.cfg.size[1], 150..=2160).text("Hauteur"),
-                        );
-                        ui.checkbox(&mut self.cfg.retry, "Reconnexion automatique");
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.delay)
-                                .range(1000..=300000)
-                                .suffix(" ms"),
-                        );
-                        if ui.button("R�initialiser").clicked() {
-                            self.cfg = Settings::read(&Ini::new());
-                        }
-                        if ui.button("Appliquer").clicked() {
-                            self.cfg.channel = self
-                                .cfg
-                                .channel
-                                .trim()
-                                .trim_start_matches('#')
-                                .to_ascii_lowercase();
-                            if self.cfg.channel.is_empty()
-                                || !self
-                                    .cfg
-                                    .channel
-                                    .bytes()
-                                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                            {
-                                self.error = "Entre un identifiant de cha�ne Twitch valide.".into();
-                            } else {
-                                self.cfg.position = ctx
-                                    .input(|i| i.viewport().outer_rect.map(|r| [r.min.x, r.min.y]));
-                                match self.cfg.save() {
-                                    Err(e) => self.error = e.to_string(),
-                                    Ok(()) => {
-                                        self.error.clear();
-                                        ctx.send_viewport_cmd(Cmd::InnerSize(egui::vec2(
-                                            self.cfg.size[0] as f32,
-                                            self.cfg.size[1] as f32,
-                                        )));
-                                        self.options = false;
-                                        self.connect();
-                                    }
-                                }
-                            }
-                        }
-                        ui.label(&self.error);
-                    });
-                } else {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_black_alpha((self.cfg.opacity*255/100) as u8)).inner_margin(5)).show(ctx,|ui|{
+            if self.options && ctx.input(|i|i.pointer.primary_pressed()){ctx.send_viewport_cmd(Cmd::StartDrag);}
+            if self.cfg.channel.is_empty(){ui.label("Aucune chaîne configurée. Veuillez configurer une chaîne Twitch via l’icône de la barre des tâches.");}
                     egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).stick_to_bottom(true)
                         .show(ui, |ui| {
-                            for Line(name, color, msg) in &self.lines {
+                            for Line(name, color, msg, moderator) in &self.lines {
                                 let mut job = egui::text::LayoutJob::default();
+                                if name.is_empty(){ui.label(egui::RichText::new(msg.as_str()).italics().size(self.cfg.font as f32));continue;}
                                 for (s, c) in [
-                                    (format!("{name} : "), *color),
+                                    (if *moderator {"● ".into()}else{String::new()},Color32::GREEN),
+                                    (format!("{name}: "), *color),
                                     (msg.clone(), Color32::WHITE),
                                 ] {
                                     job.append(
@@ -310,17 +316,16 @@ impl eframe::App for App {
                                 ui.label(job);
                             }
                         });
-                }
             });
     }
 }
 fn main() -> eframe::Result<()> {
     let mut ini = Ini::new();
-    let file = path("config-v2.ini");
+    let file = path("config.ini");
     let _ = ini.load(if file.exists() {
         file
     } else {
-        path("config.ini")
+        path("config-v2.ini")
     });
     let cfg = Settings::read(&ini);
     let mut viewport = egui::ViewportBuilder::default()
